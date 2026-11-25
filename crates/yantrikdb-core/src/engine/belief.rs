@@ -13,7 +13,7 @@ use crate::belief::{
 use crate::belief_query::{self, BeliefExplanation, BeliefInventory, BeliefPattern};
 use crate::contradiction::{self, ContradictionConfig, ContradictionScanResult};
 use crate::error::Result;
-use crate::state::{CognitiveEdgeKind, CognitiveNode, NodeId, NodeKind, NodePayload};
+use crate::state::{BeliefPayload, CognitiveEdgeKind, CognitiveNode, NodeId, NodeKind, NodePayload};
 
 use super::{now, YantrikDB};
 
@@ -134,13 +134,66 @@ impl YantrikDB {
         Ok(results)
     }
 
+    // ── Creation ──
+
+    /// Create and persist a belief node.
+    ///
+    /// The node id comes from the persisted allocator the rest of the graph
+    /// uses, so creation is restart-safe and cannot collide with an existing
+    /// node. `prior_log_odds` is the value before any evidence; the trail
+    /// starts empty, and every later change goes through `assert_evidence`.
+    pub fn create_belief(
+        &self,
+        proposition: &str,
+        prior_log_odds: f64,
+        domain: &str,
+        label: Option<&str>,
+        persistence: Option<f64>,
+    ) -> Result<CognitiveNode> {
+        let mut alloc = self.load_node_id_allocator()?;
+        let id = alloc.alloc(NodeKind::Belief);
+        self.persist_node_id_allocator(&alloc)?;
+
+        let payload = BeliefPayload {
+            proposition: proposition.to_string(),
+            log_odds: prior_log_odds,
+            domain: domain.to_string(),
+            evidence_trail: Vec::new(),
+            user_confirmed: false,
+            undecayed_log_odds: None,
+        };
+        let mut node = CognitiveNode::new(
+            id,
+            label.unwrap_or(proposition).to_string(),
+            NodePayload::Belief(payload),
+        );
+        node.attrs.confidence = crate::state::sigmoid(prior_log_odds);
+        if let Some(p) = persistence {
+            node.attrs.persistence = p.clamp(0.0, 1.0);
+        }
+        self.persist_cognitive_node(&node)?;
+        Ok(node)
+    }
+
     // ── Belief Revision (batch staleness + ceiling) ──
 
     /// Run belief revision on all persistent beliefs: staleness decay + ceiling.
     ///
     /// This should be called during the `think()` loop to keep beliefs current.
     pub fn revise_all_beliefs(&self, config: &BeliefRevisionConfig) -> Result<RevisionSummary> {
-        let now_secs = now();
+        self.revise_all_beliefs_at(now(), config)
+    }
+
+    /// [`revise_all_beliefs`] with the clock supplied by the caller.
+    ///
+    /// Same revision, same persistence — only the instant is not the wall
+    /// clock. A caller that measures time-based behaviour cannot otherwise be
+    /// deterministic: two runs a microsecond apart are two different instants.
+    pub fn revise_all_beliefs_at(
+        &self,
+        now_secs: f64,
+        config: &BeliefRevisionConfig,
+    ) -> Result<RevisionSummary> {
 
         // Load all belief nodes
         let mut beliefs = self.load_cognitive_nodes_by_kind(NodeKind::Belief)?;

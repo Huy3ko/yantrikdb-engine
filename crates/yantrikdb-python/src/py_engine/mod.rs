@@ -1,3 +1,4 @@
+mod belief_api;
 mod cognition;
 mod graph;
 mod inspect;
