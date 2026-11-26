@@ -6,7 +6,7 @@ use rusqlite::params;
 use crate::engine::YantrikDB;
 use crate::error::Result;
 use crate::scoring;
-use crate::types::{PersistedTrigger, Trigger, TriggerType};
+use crate::types::{MaintenanceDiagnostic, PersistedTrigger, Trigger, TriggerType};
 
 fn now() -> f64 {
     crate::time::now_secs()
@@ -268,6 +268,32 @@ pub fn check_temporal_drift(db: &YantrikDB) -> Result<Vec<Trigger>> {
 /// bad suggestion. This is the same boundary `consolidate_cluster` enforces
 /// with a hard error when a cluster spans namespaces.
 pub fn check_redundancy(db: &YantrikDB, sim_threshold: f64) -> Result<Vec<Trigger>> {
+    let mut diagnostics = Vec::new();
+    let triggers = check_redundancy_with_diagnostics(db, sim_threshold, &mut diagnostics)?;
+    for d in &diagnostics {
+        tracing::warn!(
+            phase = %d.phase,
+            namespace = d.namespace.as_deref().unwrap_or("<store>"),
+            cause = %d.cause,
+            "redundancy scan degraded"
+        );
+    }
+    Ok(triggers)
+}
+
+/// Same scan, but a namespace that could not be checked is reported through
+/// `diagnostics` instead of being turned into a trigger.
+///
+/// It was a trigger until now, and that was the wrong carrier: a trigger has a
+/// lifecycle (cooldown, expiry, `DecayReview` fallback), and an operating
+/// diagnostic must not be persisted, cooled down or decayed. The caller that
+/// runs the whole pass (`think`) passes its own vector and returns it to the
+/// user.
+pub fn check_redundancy_with_diagnostics(
+    db: &YantrikDB,
+    sim_threshold: f64,
+    diagnostics: &mut Vec<MaintenanceDiagnostic>,
+) -> Result<Vec<Trigger>> {
     let namespaces: Vec<String> = {
         let conn = db.conn();
         let mut stmt = conn.prepare(
@@ -281,41 +307,28 @@ pub fn check_redundancy(db: &YantrikDB, sim_threshold: f64) -> Result<Vec<Trigge
 
     let mut triggers = Vec::new();
     for namespace in namespaces {
-        triggers.extend(check_redundancy_in_namespace(
-            db,
-            &namespace,
-            sim_threshold,
-        )?);
+        // Per NAMESPACE, not per call: a hard failure inside one namespace
+        // (e.g. a `memory_entities` query with `?`) used to abort the loop and
+        // leave every following namespace unexamined — reported as one
+        // diagnostic without a namespace, i.e. without the information needed
+        // to repair it.
+        match check_redundancy_in_namespace(db, &namespace, sim_threshold, diagnostics) {
+            Ok(mut v) => triggers.append(&mut v),
+            Err(e) => diagnostics.push(MaintenanceDiagnostic::failed(
+                "redundancy_scan",
+                Some(&namespace),
+                &e,
+            )),
+        }
     }
     Ok(triggers)
-}
-
-/// A maintenance run must say when a namespace was not fully checked.
-///
-/// "No conflicts found" and "conflicts could not be evaluated" are different
-/// answers, and only one of them is good news. The log alone is not enough:
-/// whoever reads the result has to see it.
-fn incomplete_namespace_trigger(namespace: &str, reason: &str) -> Trigger {
-    Trigger {
-        trigger_type: "maintenance_incomplete".to_string(),
-        reason: format!(
-            "namespace {namespace} was not fully checked: {reason}; \
-             substitution conflicts are missing for it"
-        ),
-        urgency: 0.9,
-        source_rids: vec![],
-        suggested_action:
-            "inspect the substitution tables; this namespace's substitution conflicts \
-             were not evaluated"
-                .to_string(),
-        context: std::collections::HashMap::new(),
-    }
 }
 
 fn check_redundancy_in_namespace(
     db: &YantrikDB,
     namespace: &str,
     sim_threshold: f64,
+    diagnostics: &mut Vec<MaintenanceDiagnostic>,
 ) -> Result<Vec<Trigger>> {
     // Phase 1: Collect memory data while holding the conn lock.
     let rows: Vec<(String, String, Vec<u8>)> = {
@@ -370,7 +383,11 @@ fn check_redundancy_in_namespace(
             // Loaded, but degraded (missing tables): the index is empty and
             // still usable — the reason must reach the report.
             Ok((index, Some(reason))) => {
-                triggers.push(incomplete_namespace_trigger(namespace, &reason));
+                diagnostics.push(MaintenanceDiagnostic::incomplete(
+                    "redundancy_scan",
+                    Some(namespace),
+                    reason,
+                ));
                 index
             }
             // Degrade, do not abort. Review 8 (finding 3): propagating took
@@ -384,7 +401,11 @@ fn check_redundancy_in_namespace(
                     "substitution index unavailable for this namespace; \
                      substitution conflicts are skipped for it"
                 );
-                triggers.push(incomplete_namespace_trigger(namespace, &format!("{e}")));
+                diagnostics.push(MaintenanceDiagnostic::failed(
+                    "redundancy_scan",
+                    Some(namespace),
+                    &e,
+                ));
                 SubstitutionIndex::new()
             }
         }
@@ -3109,28 +3130,130 @@ mod tests {
             .execute("DROP TABLE substitution_members", [])
             .unwrap();
 
-        let triggers = check_redundancy(&db, 0.85).unwrap();
-        let marked: Vec<_> = triggers
+        let mut diagnostics = Vec::new();
+        let triggers = check_redundancy_with_diagnostics(&db, 0.85, &mut diagnostics).unwrap();
+
+        // It must not be a trigger any more: a diagnostic has no lifecycle.
+        assert!(
+            triggers
+                .iter()
+                .all(|t| t.trigger_type != "maintenance_incomplete"),
+            "an operating diagnostic must not be carried as a trigger: {triggers:?}"
+        );
+
+        let marked: Vec<_> = diagnostics
             .iter()
-            .filter(|t| t.trigger_type == "maintenance_incomplete")
+            .filter(|d| d.phase == "redundancy_scan")
             .collect();
         assert_eq!(
             marked.len(),
             1,
-            "the incomplete namespace must be reported: {triggers:?}"
+            "the incomplete namespace must be reported: {diagnostics:?}"
         );
-        assert!(
-            marked[0].reason.contains("was not fully checked"),
-            "the reason must say what was skipped: {:?}",
-            marked[0].reason
-        );
+        assert_eq!(marked[0].namespace.as_deref(), Some("default"));
+        assert_eq!(marked[0].status, "incomplete");
         // The store ran V13->V14 (it has the schema), so the missing tables are
-        // damage, not an old store — the reason must say that (review 9, E3).
+        // damage, not an old store — the cause must say that (review 9, E3).
         assert!(
-            marked[0].reason.contains("migration did not complete"),
+            marked[0].cause.contains("migration did not complete"),
             "the damage case must be named: {:?}",
-            marked[0].reason
+            marked[0].cause
         );
+    }
+
+    /// The whole pass, not just the isolated scan: a damaged substitution index
+    /// used to abort think() through `check_gossip_triggers`, which joins the
+    /// same table. Every other phase had to pay for it.
+    #[test]
+    fn think_degrades_instead_of_aborting_on_a_damaged_index() {
+        let db = YantrikDB::new(":memory:", 8).unwrap();
+        db.record(
+            "der zahlungsdienst verwendet postgresql als datenspeicher.",
+            "semantic",
+            0.5,
+            0.0,
+            604800.0,
+            &serde_json::json!({}),
+            &vec_seed(1.0, 8),
+            "default",
+            0.8,
+            "general",
+            "user",
+            None,
+        )
+        .unwrap();
+        db.conn()
+            .execute("DROP TABLE substitution_members", [])
+            .unwrap();
+
+        let result = db
+            .think(&crate::types::ThinkConfig::default())
+            .expect("think() must degrade, not return Err");
+
+        let phases: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .map(|d| d.phase.as_str())
+            .collect();
+        assert!(
+            phases.contains(&"redundancy_scan"),
+            "the scan that could not run must be named: {phases:?}"
+        );
+        assert!(
+            phases.contains(&"gossip_scan"),
+            "F3c: the gossip scan joins the same table and must degrade too: {phases:?}"
+        );
+        // And the pass still produced a result for the phases that could run.
+        assert!(result.duration_ms > 0);
+        // A caller that ignores `diagnostics` must still see that the pass was
+        // not clean.
+        assert_eq!(result.status, "degraded");
+    }
+
+    /// `strict` restores the pre-diagnostics contract for callers that cannot
+    /// act on a partial result.
+    #[test]
+    fn strict_mode_turns_a_degraded_pass_into_an_error() {
+        let db = YantrikDB::new(":memory:", 8).unwrap();
+        db.record(
+            "der zahlungsdienst verwendet postgresql als datenspeicher.",
+            "semantic",
+            0.5,
+            0.0,
+            604800.0,
+            &serde_json::json!({}),
+            &vec_seed(1.0, 8),
+            "default",
+            0.8,
+            "general",
+            "user",
+            None,
+        )
+        .unwrap();
+        db.conn()
+            .execute("DROP TABLE substitution_members", [])
+            .unwrap();
+
+        let cfg = crate::types::ThinkConfig {
+            strict: true,
+            ..Default::default()
+        };
+        let err = db.think(&cfg).expect_err("strict mode must not return Ok");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("redundancy_scan") || msg.contains("gossip_scan"),
+            "the error must name the degraded phase: {msg}"
+        );
+        assert!(msg.contains("strict mode"), "the error must say why: {msg}");
+    }
+
+    /// A healthy pass says `ok` — the field must not be permanently degraded.
+    #[test]
+    fn a_clean_pass_reports_ok() {
+        let db = YantrikDB::new(":memory:", 8).unwrap();
+        let result = db.think(&crate::types::ThinkConfig::default()).unwrap();
+        assert_eq!(result.status, "ok");
+        assert!(result.diagnostics.is_empty());
     }
 
     /// A token mentioned earlier in the text must not hide the statement.
@@ -3151,10 +3274,11 @@ mod tests {
         );
     }
 
-    /// A sentence pair that matches exactly must not be outranked by a wider
-    /// pair that merely shares more words.
     #[test]
     fn a_better_matching_sentence_pair_is_not_outranked_by_a_wider_one() {
+        // Sentence 1 shares four words but has three extras (4/7 = 0.57);
+        // sentence 2 is identical apart from the value (2/2 = 1.0). Ranking by
+        // `shared` first picked the first pair and refused on 0.57.
         let a = "postgresql alpha beta gamma delta epsilon. postgresql omega sigma.";
         let b = "mysql alpha beta gamma delta zeta. mysql omega sigma.";
         assert!(

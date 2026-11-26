@@ -83,6 +83,12 @@ impl YantrikDB {
         let start = crate::time::Instant::now();
         let ts = now();
 
+        // Operating diagnostics for THIS pass. A failing phase is recorded
+        // here and the pass continues: one damaged index must not cost the
+        // user the other six phases, and a call that returns Err tells the
+        // caller nothing about what DID run. See `MaintenanceDiagnostic`.
+        let mut diagnostics: Vec<MaintenanceDiagnostic> = Vec::new();
+
         // Phase -1 (#95): materialize what the caller just wrote, BEFORE
         // anything reads it.
         //
@@ -112,10 +118,17 @@ impl YantrikDB {
         match self.drain_materializer_backlog() {
             Ok(0) => {}
             Ok(n) => tracing::debug!(applied = n, "think: drained materializer backlog"),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "think: materializer drain failed; scanning possibly-stale derived state"
-            ),
+            Err(e) => {
+                diagnostics.push(MaintenanceDiagnostic::failed(
+                    "materializer_drain",
+                    None,
+                    &e,
+                ));
+                tracing::warn!(
+                    error = %e,
+                    "think: materializer drain failed; scanning possibly-stale derived state"
+                )
+            }
         }
 
         // #142: `conflicts_found` used to sum only the two Phase-2 scans, but
@@ -125,37 +138,83 @@ impl YantrikDB {
         // written across the whole cycle makes the number mean "what think()
         // actually persisted", and stays correct when a fourth writer appears.
         let conflicts_before: i64 = if config.run_conflict_scan {
-            self.conn()
+            match self
+                .conn()
                 .query_row("SELECT COUNT(*) FROM conflicts", [], |r| r.get(0))
-                .unwrap_or(0)
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    // Without the baseline the delta below is meaningless, and
+                    // `conflicts_found: 0` would read as "none exist".
+                    diagnostics.push(MaintenanceDiagnostic::failed("conflict_count", None, &e));
+                    -1
+                }
+            }
         } else {
             0
         };
 
-        // Phase 0: Expire old triggers
-        let expired = crate::triggers::expire_triggers(self, ts)?;
+        // Phase 0: Expire old triggers. Degrades: an unusable trigger table
+        // must not stop the conflict scan.
+        let expired = match crate::triggers::expire_triggers(self, ts) {
+            Ok(n) => n,
+            Err(e) => {
+                diagnostics.push(MaintenanceDiagnostic::failed("trigger_expiry", None, &e));
+                0
+            }
+        };
 
-        // Phase 1: Run all trigger checks
+        // Phase 1: Run all trigger checks. Each check is independent — a
+        // missing index used by one of them is a reason to record a
+        // diagnostic, not to abandon the other seven.
         let mut all_triggers = Vec::new();
-        all_triggers.extend(crate::triggers::check_decay_triggers(
-            self,
-            config.importance_threshold,
-            config.decay_threshold,
-            config.max_triggers,
-        )?);
-        all_triggers.extend(crate::triggers::check_consolidation_triggers(
-            self,
-            config.min_active_memories,
-        )?);
-        all_triggers.extend(crate::triggers::check_conflict_escalation(self)?);
-        all_triggers.extend(crate::triggers::check_temporal_drift(self)?);
-        all_triggers.extend(crate::triggers::check_redundancy(
+        let mut run = |phase: &str, r: Result<Vec<Trigger>>| match r {
+            Ok(mut v) => all_triggers.append(&mut v),
+            Err(e) => diagnostics.push(MaintenanceDiagnostic::failed(phase, None, &e)),
+        };
+        run(
+            "decay_check",
+            crate::triggers::check_decay_triggers(
+                self,
+                config.importance_threshold,
+                config.decay_threshold,
+                config.max_triggers,
+            ),
+        );
+        run(
+            "consolidation_check",
+            crate::triggers::check_consolidation_triggers(self, config.min_active_memories),
+        );
+        run(
+            "conflict_escalation",
+            crate::triggers::check_conflict_escalation(self),
+        );
+        run(
+            "temporal_drift",
+            crate::triggers::check_temporal_drift(self),
+        );
+        run(
+            "relationship_insight",
+            crate::triggers::check_relationship_insight(self),
+        );
+        run("valence_trend", crate::triggers::check_valence_trend(self));
+        run(
+            "entity_anomaly",
+            crate::triggers::check_entity_anomaly(self),
+        );
+        drop(run);
+
+        // The redundancy scan reports namespaces it could not evaluate through
+        // the same diagnostics vector, so it runs after the closure that
+        // borrows it is dropped.
+        match crate::triggers::check_redundancy_with_diagnostics(
             self,
             config.redundancy_sim_threshold,
-        )?);
-        all_triggers.extend(crate::triggers::check_relationship_insight(self)?);
-        all_triggers.extend(crate::triggers::check_valence_trend(self)?);
-        all_triggers.extend(crate::triggers::check_entity_anomaly(self)?);
+            &mut diagnostics,
+        ) {
+            Ok(mut v) => all_triggers.append(&mut v),
+            Err(e) => diagnostics.push(MaintenanceDiagnostic::failed("redundancy_scan", None, &e)),
+        }
 
         // Phase 1.9 (v0.7.23 prototype): bridge free-text attribute-value
         // facts into the claim layer so the conflict scan below can see
@@ -164,6 +223,7 @@ impl YantrikDB {
         // a failure here must not abort the cognition loop.
         if config.extract_attribute_claims && config.run_conflict_scan && !self.is_encrypted() {
             if let Err(e) = self.ingest_attribute_claims(ATTR_CLAIM_SCAN_LIMIT) {
+                diagnostics.push(MaintenanceDiagnostic::failed("attribute_claims", None, &e));
                 tracing::warn!(error = %e, "attribute-claim extraction pass failed");
             }
         }
@@ -172,41 +232,87 @@ impl YantrikDB {
         // (so contradictions are flagged before similar memories get merged)
         // Uses consolidation_limit to cap work per call (incremental processing).
         let conflicts_found = if config.run_conflict_scan {
-            crate::conflict::scan_conflicts_limited(self, config.consolidation_limit)?;
+            if let Err(e) =
+                crate::conflict::scan_conflicts_limited(self, config.consolidation_limit)
+            {
+                diagnostics.push(MaintenanceDiagnostic::failed("conflict_scan", None, &e));
+            }
             // RFC 006 Phase 1: also scan claim-based conflicts (scoped, with severity + reason codes)
-            crate::conflict::scan_claim_conflicts(self, config.consolidation_limit)?;
+            if let Err(e) = crate::conflict::scan_claim_conflicts(self, config.consolidation_limit)
+            {
+                diagnostics.push(MaintenanceDiagnostic::failed(
+                    "claim_conflict_scan",
+                    None,
+                    &e,
+                ));
+            }
             // Delta over the whole cycle rather than the sum of these two scans'
             // return values — see the note at `conflicts_before`. Saturating
             // because consolidation can tombstone rows, and a negative "found"
             // would be worse than an undercount.
-            let after: i64 = self
-                .conn()
-                .query_row("SELECT COUNT(*) FROM conflicts", [], |r| r.get(0))
-                .unwrap_or(conflicts_before);
-            (after - conflicts_before).max(0) as usize
+            let after: i64 =
+                match self
+                    .conn()
+                    .query_row("SELECT COUNT(*) FROM conflicts", [], |r| r.get(0))
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        diagnostics.push(MaintenanceDiagnostic::failed("conflict_count", None, &e));
+                        conflicts_before
+                    }
+                };
+            if conflicts_before < 0 || after < 0 {
+                // A count that could not be taken is not a zero.
+                0
+            } else {
+                (after - conflicts_before).max(0) as usize
+            }
         } else {
             0
         };
 
-        // Phase 2.5: Check if any substitution categories are ready for gossip expansion
-        all_triggers.extend(self.check_gossip_triggers()?);
+        // Phase 2.5: substitution categories ready for gossip expansion.
+        // F3c: this joins `substitution_members` too, so a damaged index made
+        // it abort the WHOLE pass via `?` — the one phase whose degradation
+        // was supposed to be handled locally.
+        match self.check_gossip_triggers() {
+            Ok(mut v) => all_triggers.append(&mut v),
+            Err(e) => diagnostics.push(MaintenanceDiagnostic::failed("gossip_scan", None, &e)),
+        }
 
         // Phase 3: Run consolidation if configured
         let consolidation_count = if config.run_consolidation {
-            let stats = self.stats(None)?;
-            if stats.active_memories >= config.min_active_memories {
-                let results = crate::consolidate::consolidate(
-                    self,
-                    config.consolidation_sim_threshold,
-                    config.consolidation_time_window_days,
-                    config.consolidation_min_cluster,
-                    config.consolidation_limit,
-                    config.consolidation_require_entity_overlap,
-                    false,
-                )?;
-                results.len()
-            } else {
-                0
+            match self.stats(None) {
+                Ok(stats) if stats.active_memories >= config.min_active_memories => {
+                    match crate::consolidate::consolidate(
+                        self,
+                        config.consolidation_sim_threshold,
+                        config.consolidation_time_window_days,
+                        config.consolidation_min_cluster,
+                        config.consolidation_limit,
+                        config.consolidation_require_entity_overlap,
+                        false,
+                    ) {
+                        Ok(results) => results.len(),
+                        Err(e) => {
+                            diagnostics.push(MaintenanceDiagnostic::failed(
+                                "consolidation",
+                                None,
+                                &e,
+                            ));
+                            0
+                        }
+                    }
+                }
+                Ok(_) => 0,
+                Err(e) => {
+                    diagnostics.push(MaintenanceDiagnostic::failed(
+                        "consolidation_stats",
+                        None,
+                        &e,
+                    ));
+                    0
+                }
             }
         } else {
             0
@@ -214,7 +320,17 @@ impl YantrikDB {
 
         // Phase 4: Mine patterns
         let pattern_result = if config.run_pattern_mining {
-            crate::patterns::mine_patterns(self, &PatternConfig::default())?
+            match crate::patterns::mine_patterns(self, &PatternConfig::default()) {
+                Ok(r) => r,
+                Err(e) => {
+                    diagnostics.push(MaintenanceDiagnostic::failed("pattern_mining", None, &e));
+                    PatternMiningResult {
+                        new_patterns: 0,
+                        updated_patterns: 0,
+                        stale_patterns: 0,
+                    }
+                }
+            }
         } else {
             PatternMiningResult {
                 new_patterns: 0,
@@ -243,6 +359,7 @@ impl YantrikDB {
             }
             Ok(_) => {} // abstained (insufficient/no-new evidence) or rejected
             Err(e) => {
+                diagnostics.push(MaintenanceDiagnostic::failed("learning_loop", None, &e));
                 tracing::warn!(error = %e, "learning loop failed");
             }
         }
@@ -250,7 +367,13 @@ impl YantrikDB {
         // Phase 5: Generate pattern_discovered triggers for new patterns
         // Cross-domain and entity_bridge patterns get higher urgency ("surprise" triggers)
         if pattern_result.new_patterns > 0 {
-            let new_patterns = crate::patterns::get_patterns(self, None, Some("active"), 10)?;
+            let new_patterns = match crate::patterns::get_patterns(self, None, Some("active"), 10) {
+                Ok(v) => v,
+                Err(e) => {
+                    diagnostics.push(MaintenanceDiagnostic::failed("pattern_readback", None, &e));
+                    Vec::new()
+                }
+            };
             for p in new_patterns {
                 let mut context = std::collections::HashMap::new();
                 context.insert(
@@ -315,99 +438,121 @@ impl YantrikDB {
         // Check for gaps between sessions and surface context from last session
         {
             let conn = self.conn();
-            let mut session_stmt = conn.prepare(
-                "SELECT session_id, client_id, ended_at, summary, avg_valence, memory_count, topics \
-                 FROM sessions WHERE status = 'ended' \
-                 ORDER BY ended_at DESC LIMIT 1",
-            )?;
-            if let Ok((
-                session_id,
-                client_id,
-                ended_at,
-                summary,
-                avg_valence,
-                memory_count,
-                topics_json,
-            )) = session_stmt.query_row([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, f64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<f64>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            }) {
-                let gap_hours = (ts - ended_at) / 3600.0;
-                let topics: Vec<String> = serde_json::from_str(&topics_json).unwrap_or_default();
+            // Degrades: the sessions table is not part of the substitution
+            // index, but a prepare failure here must not cost the phases that
+            // come after it.
+            let phase = (|| -> Result<Vec<Trigger>> {
+                let mut out = Vec::new();
+                let mut session_stmt = conn.prepare(
+                    "SELECT session_id, client_id, ended_at, summary, avg_valence, memory_count, topics \
+                     FROM sessions WHERE status = 'ended' \
+                     ORDER BY ended_at DESC LIMIT 1",
+                )?;
+                if let Ok((
+                    session_id,
+                    client_id,
+                    ended_at,
+                    summary,
+                    avg_valence,
+                    memory_count,
+                    topics_json,
+                )) = session_stmt.query_row([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<f64>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                }) {
+                    let gap_hours = (ts - ended_at) / 3600.0;
+                    let topics: Vec<String> =
+                        serde_json::from_str(&topics_json).unwrap_or_default();
 
-                // Generate session awareness trigger if there's a meaningful gap
-                if gap_hours > 4.0 {
-                    let mut context = std::collections::HashMap::new();
-                    context.insert("last_session_id".to_string(), serde_json::json!(session_id));
-                    context.insert("client_id".to_string(), serde_json::json!(client_id));
-                    context.insert("gap_hours".to_string(), serde_json::json!(gap_hours));
-                    context.insert(
-                        "last_session_memory_count".to_string(),
-                        serde_json::json!(memory_count),
-                    );
-                    context.insert("last_session_topics".to_string(), serde_json::json!(topics));
-                    if let Some(ref s) = summary {
-                        context.insert("last_session_summary".to_string(), serde_json::json!(s));
-                    }
-                    if let Some(v) = avg_valence {
-                        context.insert("last_session_valence".to_string(), serde_json::json!(v));
-                    }
+                    // Generate session awareness trigger if there's a meaningful gap
+                    if gap_hours > 4.0 {
+                        let mut context = std::collections::HashMap::new();
+                        context
+                            .insert("last_session_id".to_string(), serde_json::json!(session_id));
+                        context.insert("client_id".to_string(), serde_json::json!(client_id));
+                        context.insert("gap_hours".to_string(), serde_json::json!(gap_hours));
+                        context.insert(
+                            "last_session_memory_count".to_string(),
+                            serde_json::json!(memory_count),
+                        );
+                        context
+                            .insert("last_session_topics".to_string(), serde_json::json!(topics));
+                        if let Some(ref s) = summary {
+                            context
+                                .insert("last_session_summary".to_string(), serde_json::json!(s));
+                        }
+                        if let Some(v) = avg_valence {
+                            context
+                                .insert("last_session_valence".to_string(), serde_json::json!(v));
+                        }
 
-                    let urgency = if gap_hours > 72.0 {
-                        0.7
-                    } else if gap_hours > 24.0 {
-                        0.5
-                    } else {
-                        0.3
-                    };
-                    let reason = if gap_hours > 24.0 {
-                        format!(
+                        let urgency = if gap_hours > 72.0 {
+                            0.7
+                        } else if gap_hours > 24.0 {
+                            0.5
+                        } else {
+                            0.3
+                        };
+                        let reason = if gap_hours > 24.0 {
+                            format!(
                             "It's been {:.0} hours since your last session. Last time: {} memories stored{}.",
                             gap_hours,
                             memory_count,
                             summary.as_ref().map(|s| format!(" — {}", s)).unwrap_or_default(),
                         )
-                    } else {
-                        format!(
-                            "Welcome back ({:.0}h gap). Last session: {} memories{}.",
-                            gap_hours,
-                            memory_count,
-                            if !topics.is_empty() {
-                                format!(
-                                    " about {}",
-                                    topics
-                                        .iter()
-                                        .take(3)
-                                        .cloned()
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )
-                            } else {
-                                String::new()
-                            },
-                        )
-                    };
+                        } else {
+                            format!(
+                                "Welcome back ({:.0}h gap). Last session: {} memories{}.",
+                                gap_hours,
+                                memory_count,
+                                if !topics.is_empty() {
+                                    format!(
+                                        " about {}",
+                                        topics
+                                            .iter()
+                                            .take(3)
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                } else {
+                                    String::new()
+                                },
+                            )
+                        };
 
-                    all_triggers.push(Trigger {
-                        trigger_type: "session_awareness".to_string(),
-                        reason,
-                        urgency,
-                        source_rids: vec![],
-                        suggested_action: "acknowledge".to_string(),
-                        context,
-                    });
+                        out.push(Trigger {
+                            trigger_type: "session_awareness".to_string(),
+                            reason,
+                            urgency,
+                            source_rids: vec![],
+                            suggested_action: "acknowledge".to_string(),
+                            context,
+                        });
+                    }
+                }
+                Ok(out)
+            })();
+            match phase {
+                Ok(mut v) => all_triggers.append(&mut v),
+                Err(e) => {
+                    diagnostics.push(MaintenanceDiagnostic::failed("session_awareness", None, &e))
                 }
             }
         }
 
-        // Phase 6: Deduplicate, cooldown-filter, persist triggers
+        // Phase 6: Deduplicate, cooldown-filter, persist triggers.
+        //
+        // This one RAISES even in degrade mode: if the triggers cannot be
+        // stored, the pass produced its main output nowhere, and a caller that
+        // received `triggers: []` with no error would believe it was clean.
         let filtered = crate::triggers::filter_and_persist_triggers(self, all_triggers, ts)?;
 
         // Phase 7: Sort by urgency, truncate
@@ -415,9 +560,17 @@ impl YantrikDB {
         final_triggers.sort_by(|a, b| b.urgency.total_cmp(&a.urgency));
         final_triggers.truncate(config.max_triggers);
 
-        // Phase 7: Derive personality traits
+        // Phase 7: Derive personality traits. Degrades with a diagnostic:
+        // `personality_updated: false` alone cannot be told apart from
+        // "nothing to update".
         let personality_updated = if config.run_personality {
-            crate::personality::derive_personality(self).is_ok()
+            match crate::personality::derive_personality(self) {
+                Ok(_) => true,
+                Err(e) => {
+                    diagnostics.push(MaintenanceDiagnostic::failed("personality", None, &e));
+                    false
+                }
+            }
         } else {
             false
         };
@@ -432,18 +585,24 @@ impl YantrikDB {
         // saying so.
         {
             let conn = self.conn();
-            if config.run_conflict_scan {
-                Self::clear_maintenance_debt_on(&conn, ts)?;
+            let ledger = if config.run_conflict_scan {
+                Self::clear_maintenance_debt_on(&conn, ts)
             } else {
                 conn.execute(
                     "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_think_at', ?1)",
                     params![ts.to_string()],
-                )?;
-            }
+                )
+                .map(|_| ())
+                .map_err(Into::into)
+            };
+            // Raises even in degrade mode: the ledger is how the store knows
+            // which writes have been examined. A pass that did not settle it
+            // has not done its job, and silence would make the debt permanent.
+            ledger?;
         }
 
         // Log think op (informational, not materialized on remote)
-        self.log_op(
+        if let Err(e) = self.log_op(
             "think",
             None,
             &serde_json::json!({
@@ -451,11 +610,36 @@ impl YantrikDB {
                 "consolidation_count": consolidation_count,
                 "conflicts_found": conflicts_found,
                 "new_patterns": pattern_result.new_patterns,
+                "diagnostics": diagnostics.len(),
             }),
             None,
-        )?;
+        ) {
+            diagnostics.push(MaintenanceDiagnostic::failed("op_log", None, &e));
+        }
 
         let duration_ms = start.elapsed_ms();
+
+        let status = if diagnostics.is_empty() {
+            "ok".to_string()
+        } else {
+            "degraded".to_string()
+        };
+        // `strict` restores the pre-diagnostics contract for callers that
+        // cannot act on a partial result: a degraded pass is an error.
+        if config.strict {
+            if let Some(first) = diagnostics.first() {
+                return Err(crate::error::YantrikDbError::InvalidInput(format!(
+                    "maintenance degraded in {}{}: {} (strict mode)",
+                    first.phase,
+                    first
+                        .namespace
+                        .as_deref()
+                        .map(|n| format!("@{n}"))
+                        .unwrap_or_default(),
+                    first.cause
+                )));
+            }
+        }
 
         Ok(ThinkResult {
             triggers: final_triggers,
@@ -466,6 +650,8 @@ impl YantrikDB {
             expired_triggers: expired,
             personality_updated,
             duration_ms,
+            status,
+            diagnostics,
         })
     }
 

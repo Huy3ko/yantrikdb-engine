@@ -1349,6 +1349,16 @@ pub struct ThinkConfig {
     pub consolidation_require_entity_overlap: bool,
     pub min_active_memories: i64,
     pub run_personality: bool,
+    /// When true, a degraded phase is returned as an error instead of a
+    /// diagnostic. Default false — the pass degrades — because one damaged
+    /// index must not cost the caller the other six phases.
+    ///
+    /// Two phases raise regardless of this flag: failing to persist triggers
+    /// or to settle the maintenance ledger is a store problem, not a degraded
+    /// check, and a caller that gets `triggers: []` without an error would
+    /// believe the pass was clean.
+    #[serde(default)]
+    pub strict: bool,
     /// **v0.7.23 prototype.** When true, `think()` extracts simple
     /// "<subject> is <value>" assertions from free-text memories into the
     /// claim layer so `scan_claim_conflicts` can detect attribute-value
@@ -1361,6 +1371,10 @@ pub struct ThinkConfig {
 
 fn default_redundancy_sim_threshold() -> f64 {
     0.85
+}
+
+fn default_think_status() -> String {
+    "ok".to_string()
 }
 
 impl Default for ThinkConfig {
@@ -1380,6 +1394,7 @@ impl Default for ThinkConfig {
             consolidation_require_entity_overlap: true,
             min_active_memories: 10,
             run_personality: true,
+            strict: false,
             extract_attribute_claims: false,
         }
     }
@@ -1396,6 +1411,60 @@ pub struct ThinkResult {
     pub expired_triggers: usize,
     pub personality_updated: bool,
     pub duration_ms: u64,
+    /// `ok` when every enabled phase ran to completion, `degraded` when at
+    /// least one recorded a diagnostic. A caller that ignores `diagnostics`
+    /// still sees this field — the whole point is that a clean pass and a
+    /// damaged one cannot look the same by accident.
+    #[serde(default = "default_think_status")]
+    pub status: String,
+    /// Maintenance phases that could not run completely on this pass.
+    ///
+    /// These are OPERATING diagnostics, deliberately separate from `triggers`:
+    /// no trigger lifecycle, no `trigger_log` row, no cooldown, no decay.
+    /// They answer one question — "was this phase actually evaluated?" —
+    /// because `conflicts_found: 0` from a phase that never ran reads exactly
+    /// like "no conflicts exist", and the second reading is a lie.
+    ///
+    /// `serde(default)` so a caller that predates the field still deserializes
+    /// a result.
+    #[serde(default)]
+    pub diagnostics: Vec<MaintenanceDiagnostic>,
+}
+
+/// One degraded maintenance phase. See [`ThinkResult::diagnostics`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceDiagnostic {
+    /// The phase that degraded: `conflict_scan`, `redundancy_scan`,
+    /// `gossip_scan`, `consolidation`, `pattern_mining`, `trigger_extraction`,
+    /// `trigger_persistence`, `maintenance_ledger`, …
+    pub phase: String,
+    /// Namespace the phase was working on, when it is namespace-scoped.
+    pub namespace: Option<String>,
+    /// What went wrong, as reported by the failing layer.
+    pub cause: String,
+    /// `incomplete` when the phase ran partially, `failed` when it did not
+    /// run at all.
+    pub status: String,
+}
+
+impl MaintenanceDiagnostic {
+    /// A phase that did not run at all.
+    pub fn failed(phase: &str, namespace: Option<&str>, cause: impl ToString) -> Self {
+        Self {
+            phase: phase.to_string(),
+            namespace: namespace.map(str::to_string),
+            cause: cause.to_string(),
+            status: "failed".to_string(),
+        }
+    }
+
+    /// A phase that ran but skipped part of its work.
+    pub fn incomplete(phase: &str, namespace: Option<&str>, cause: impl ToString) -> Self {
+        Self {
+            status: "incomplete".to_string(),
+            ..Self::failed(phase, namespace, cause)
+        }
+    }
 }
 
 /// A persisted trigger with lifecycle state.

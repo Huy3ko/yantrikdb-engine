@@ -456,6 +456,11 @@ def memory_think(
         "patterns_updated": result["patterns_updated"],
         "expired_triggers": result["expired_triggers"],
         "duration_ms": round(result["duration_ms"], 2),
+        "status": result.get("status", "ok"),
+        # Operating diagnostics: phases that could not run to completion. An
+        # agent that reads only `conflicts_found` cannot tell "nothing found"
+        # from "never looked".
+        "diagnostics": list(result.get("diagnostics", [])),
     })
 
 
