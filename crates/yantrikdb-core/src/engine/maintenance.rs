@@ -237,6 +237,19 @@ impl YantrikDB {
                     report.think_consolidations = Some(tr.consolidation_count);
                     report.think_conflicts_found = Some(tr.conflicts_found);
                     report.think_triggers_expired = Some(tr.expired_triggers);
+                    // A phase that could not run is an error of this cycle,
+                    // not a zero: the report is what the sleep loop shows.
+                    for d in &tr.diagnostics {
+                        report.errors.push(format!(
+                            "think {}{}: {}",
+                            d.phase,
+                            d.namespace
+                                .as_deref()
+                                .map(|n| format!("@{n}"))
+                                .unwrap_or_default(),
+                            d.cause
+                        ));
+                    }
                 }
                 Err(e) => report.errors.push(format!("think: {e}")),
             }

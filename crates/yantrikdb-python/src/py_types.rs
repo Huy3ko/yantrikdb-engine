@@ -405,6 +405,21 @@ pub fn think_result_to_dict(py: Python<'_>, r: &yantrikdb_core::ThinkResult) -> 
     dict.set_item("expired_triggers", r.expired_triggers)?;
     dict.set_item("personality_updated", r.personality_updated)?;
     dict.set_item("duration_ms", r.duration_ms)?;
+    dict.set_item("status", &r.status)?;
+
+    // Operating diagnostics: separate from `triggers` on purpose — no
+    // lifecycle, no cooldown. A caller that reports `conflicts_found: 0`
+    // without these cannot tell "nothing found" from "never looked".
+    let diags_list = pyo3::types::PyList::empty(py);
+    for d in &r.diagnostics {
+        let dd = PyDict::new(py);
+        dd.set_item("phase", &d.phase)?;
+        dd.set_item("namespace", d.namespace.as_deref())?;
+        dd.set_item("cause", &d.cause)?;
+        dd.set_item("status", &d.status)?;
+        diags_list.append(dd)?;
+    }
+    dict.set_item("diagnostics", diags_list)?;
     Ok(dict.into())
 }
 
