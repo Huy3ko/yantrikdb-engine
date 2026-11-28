@@ -146,6 +146,17 @@ pub(crate) struct ForeignSqliteGuard {
     /// The store's `-shm` path as `/proc/self/maps` prints it (canonical).
     /// `None` for `:memory:` or an unsupported platform: the guard is inert.
     shm_path: Option<PathBuf>,
+    /// `(dev, ino)` of that `-shm` when this engine last looked.
+    ///
+    /// The mapping scan only sees a foreign library WHILE it is open. A
+    /// connection that opens and closes between two scans leaves no mapping,
+    /// but it unlinks the `-shm` on close (it believes itself the last user,
+    /// because POSIX locks are per process). The engine is then left with a
+    /// shm the path no longer names, and its next commit lands in a WAL nobody
+    /// coordinates — measured: `record()` returned a rid and the row was never
+    /// visible, with no error. A changed file identity is the aftermath the
+    /// scan cannot see.
+    shm_identity: parking_lot::Mutex<Option<(u64, u64)>>,
     /// The store path for messages.
     store: String,
     mode: AtomicU8,
@@ -189,6 +200,7 @@ impl ForeignSqliteGuard {
             };
         Self {
             shm_path,
+            shm_identity: parking_lot::Mutex::new(None),
             store: db_path.to_string(),
             mode: AtomicU8::new(mode.as_u8()),
             active: AtomicBool::new(false),
@@ -395,7 +407,43 @@ impl ForeignSqliteGuard {
 
     /// The typed pre-check at a public write entry point. Each cause has
     /// its own error (issue #247); a detection, the graver, wins.
+    /// Has the `-shm` been replaced since we last looked?
+    ///
+    /// True means some other library performed a last-close on this store
+    /// inside this process. The first observation only records the identity, so
+    /// an engine opening on an existing store is never refused wrongly.
+    fn note_shm_identity(&self) -> bool {
+        let Some(path) = &self.shm_path else {
+            return false;
+        };
+        let now = shm_file_identity(path);
+        let mut slot = self.shm_identity.lock();
+        match (slot.as_ref(), now) {
+            // First look (or the store is not in WAL yet): remember it.
+            (None, Some(now)) => {
+                *slot = Some(now);
+                false
+            }
+            (None, None) => false,
+            // Same file, same identity: nothing happened.
+            (Some(prev), Some(now)) => *prev != now,
+            // The shm we knew is GONE. That is not "no information": a
+            // last-close by another library unlinks it, and the WAL with it.
+            (Some(_), None) => true,
+        }
+    }
+
     pub(crate) fn check_write(&self) -> Result<()> {
+        if self.note_shm_identity() {
+            self.tainted.store(true, Ordering::Relaxed);
+            self.detected_since_boot.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                store = %self.store,
+                "the store's -shm file was replaced under this engine: a second SQLite \
+                 library opened and closed this store in this process (issue #225). Writes \
+                 are refused until the engine is reopened."
+            );
+        }
         self.scan_cached();
         let err = if self.tainted() {
             YantrikDbError::ForeignSqliteInstance {
@@ -728,5 +776,19 @@ mod tests {
         assert!(!g.scan());
         assert!(g.check_write().is_ok());
         assert!(!g.commit_should_abort());
+    }
+}
+
+/// `(device, inode)` of a path, or `None` where the platform has no inodes.
+fn shm_file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
